@@ -1,0 +1,39 @@
+a node js trading bot that takes pump.fun mints and uses the pumpportal api to trade
+
+train on the pumpportal docs here:
+https://pumpportal.fun/data-api/real-time/
+
+the bot needs:
+configurable strategies
+<MINT> command as main paste
+some safe guards like arm and TRADE
+be super small and cappy
+
+avoid hard coding usd and sol conversions
+
+make sure you read the pumpportal api key, public wallet key
+
+the bot needs to support full simulation
+
+you should be able to watch and unwatch strategies
+
+maintain average cost and pnl, and make sure fake simulation buys with the real strategy still records and shows gain
+
+the bot should be testable on live data without buying.
+
+write one big script, no separate javascript files
+
+use a node js cli with prompts, which starts with a help section
+
+make a start.bat that starts the bot and says something like
+Commands:
+<MINT> -  set the current mint
+buy [SOL] -  buy the current mint
+sell -  sell 100% of current mint
+etc
+arm
+disarm
+status
+strategy - show strategy
+
+keep the bot minimal. no excessive or unnecessary conversions, data, or rough stuff.
