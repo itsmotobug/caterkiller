@@ -1,0 +1,12 @@
+So for the second commit, there are lots of bugs. I tested.
+
+I tested the bot and here's what happens:
+Super unreliable Profit: X status stuff.
+
+Switching strategy seems to break Profit? So profit is supposed to be a "dumb dollar to realized SOL" kind of thing, but it's on 0 when realized is > 0.
+
+Also, the Position and Status reports are basically the same, or show a lot of the same info.
+
+The reason they aren't fused, is because there would be too much info on screen.
+
+I will have to propose a merge or a cleanup of both of those status dumps.

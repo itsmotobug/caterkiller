@@ -39,16 +39,15 @@ PUMP_API_KEY=
 PUBLIC_WALLET_KEY=
 MINT=11111111111111111111111111111111111111111111
 STRATEGY=dca
-SIMULATION=true
-TRADE=false
+MODE=sim
 DCA_INTERVAL_MS=60000
 DCA_AMOUNT_SOL=0.01
 ```
 
 Notes:
 - `STRATEGY` can be `dca`, `momentum`, `meanReversion`, or `breakout`
-- `SIMULATION=true` keeps it safe by default
-- `TRADE=false` disables real trading unless you explicitly enable it
+- `MODE` is `sim` or `live`
+- `live` sends real PumpPortal trades; `sim` keeps everything local and safe
 - `DCA_INTERVAL_MS` is in milliseconds
 - `DCA_AMOUNT_SOL` is the SOL amount to buy each interval
 

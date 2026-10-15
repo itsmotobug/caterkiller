@@ -11,22 +11,65 @@ const STRATEGIES = {
   breakout: 'Buy when price breaks above the last local high.',
 };
 
+const PLACEHOLDER_DEFAULTS = {
+  SOL_PRICE: 0.000001,
+  DCA_SOL: 0.01,
+  BUY_SOL: 0.01,
+};
+
 const envPath = path.join(__dirname, '.env');
+const ANSI = {
+  reset: '\x1b[0m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[32m' // '\x1b[36m',
+};
+
+function colorize(text, code) {
+  if (!process.stdout || !process.stdout.isTTY || process.env.NO_COLOR) {
+    return text;
+  }
+  return code + text + ANSI.reset;
+}
+
+function logInfo(message) {
+  console.log(colorize(message, ANSI.cyan));
+}
+
+function logSuccess(message) {
+  console.log(colorize(message, ANSI.green));
+}
+
+function logError(message) {
+  console.log(colorize(message, ANSI.red));
+}
+
+function logWarning(message) {
+  console.log(colorize(message, ANSI.yellow));
+}
+
 const state = {
   mint: '',
   strategy: 'dca',
-  strategyRunning: false,
-  trade: false,
-  simulation: true,
+  botRunning: false,
+  mode: 'sim',
+  liveConfirmationPending: false,
   apiKey: '',
   publicWallet: '',
   currentPrice: null,
   lastPrice: null,
+  solanaUsdPrice: null,
+  priceHistory: [],
+  lastSignalAt: 0,
+  strategyCooldownMs: 10 * 1000,
   dcaIntervalMs: 60 * 1000,
-  dcaAmountSol: 0.01,
+  dcaAmountSol: PLACEHOLDER_DEFAULTS.DCA_SOL,
   dcaLastBuyAt: 0,
-  tickerEnabled: false,
-  tickerTimer: null,
+  pumpPortalApiCalls: 0,
+  lastPumpPortalApiCallAt: null,
+  statusRenderThrottleMs: 3000,
+  lastStatusRenderAt: 0,
   rl: null,
   position: {
     tokens: 0,
@@ -37,6 +80,7 @@ const state = {
   },
   websocket: null,
   liveStreamReady: false,
+  debug: false,
 };
 
 function parseBoolean(value) {
@@ -65,21 +109,67 @@ function loadEnv(filePath) {
   return env;
 }
 
+function normalizeMode(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (value === 'live' || value === 'real') return 'live';
+  if (value === 'sim' || value === 'simulation' || value === 'dry' || value === 'dry-run') return 'sim';
+  return null;
+}
+
+function resetPromptPrefix() {
+  if (state.rl) {
+    state.rl.setPrompt('caterkiller (' + (state.mode === 'sim' ? 'simulation' : 'live') + ' / ' + state.strategy + ' / ' + (state.botRunning ? 'running' : 'stopped') + ')> ');
+  }
+}
+
+function promptForLiveConfirmation() {
+  if (!state.rl) {
+    return;
+  }
+  state.rl.setPrompt('type arm to go live> ');
+}
+
+function setMode(mode) {
+  const next = normalizeMode(mode);
+  if (!next) {
+    logError('Usage: live on|off');
+    return;
+  }
+
+  if (next === 'live') {
+    state.mode = 'sim';
+    state.liveConfirmationPending = true;
+    promptForLiveConfirmation();
+    logWarning('Going live. Type `arm` to confirm.');
+    return;
+  }
+
+  state.mode = 'sim';
+  state.liveConfirmationPending = false;
+  resetPromptPrefix();
+  logSuccess('Mode set to: sim');
+}
+
 function fillStateFromEnv() {
   const env = loadEnv(envPath);
   state.strategy = (env.STRATEGY || 'dca').trim().toLowerCase();
-  state.trade = parseBoolean(env.TRADE || 'false');
-  state.simulation = parseBoolean(env.SIMULATION ?? 'true');
+  if (env.MODE) {
+    setMode(env.MODE);
+  } else if (parseBoolean(env.TRADE || 'false')) {
+    state.mode = 'live';
+  } else if (parseBoolean(env.SIMULATION ?? 'true')) {
+    state.mode = 'sim';
+  }
   state.apiKey = (env.PUMP_API_KEY || '').trim();
   state.publicWallet = (env.PUBLIC_WALLET_KEY || '').trim();
   state.mint = (env.MINT || '').trim();
   state.dcaIntervalMs = Number(env.DCA_INTERVAL_MS || env.DCA_INTERVAL || 60000);
-  state.dcaAmountSol = Number(env.DCA_AMOUNT_SOL || env.DCA_AMOUNT || 0.01);
+  state.dcaAmountSol = Number(env.DCA_AMOUNT_SOL || env.DCA_AMOUNT || PLACEHOLDER_DEFAULTS.DCA_SOL);
   if (!Number.isFinite(state.dcaIntervalMs) || state.dcaIntervalMs <= 0) {
     state.dcaIntervalMs = 60 * 1000;
   }
   if (!Number.isFinite(state.dcaAmountSol) || state.dcaAmountSol <= 0) {
-    state.dcaAmountSol = 0.01;
+    state.dcaAmountSol = PLACEHOLDER_DEFAULTS.DCA_SOL;
   }
 
   if (!env.STRATEGY && !env.WATCHLIST) {
@@ -90,18 +180,20 @@ function fillStateFromEnv() {
 function printHelp() {
   console.log('\nCommands:');
   console.log('  <MINT>              Set the current mint address');
+  console.log('  live                Toggle live mode on/off');
   console.log('  buy [SOL]           Buy the current mint using SOL amount');
   console.log('  sell [PERCENT]      Sell 100% of the current mint position');
   console.log('  balance             Show the current SOL balance for the configured wallet');
+  console.log('  wallet              Alias for balance');
   console.log('  mcap                Show the current mint market cap from PumpPortal/Pump.fun');
-  console.log('  price [SOL]         Set or show the current token price for simulation');
-  console.log('  ticker on|off       Toggle a live cached-price ticker');
-  console.log('  status              Show wallet, strategy, holdings, and PnL');
-  console.log('  strategy [NAME]     Set the active strategy (default: dca)');
-  console.log('  start [NAME]        Start the active strategy');
+  console.log('  position            Show current position, bot state, and account snapshot');
+  console.log('  pos                 Alias for position');
+  console.log('  info                Alias for position');
+  console.log('  strategy [NAME]     Set the active strategy');
+  console.log('  strat [NAME]        Alias for strategy');
+  console.log('  debug              Toggle verbose trade-signal logging');
+  console.log('  start               Start the active strategy');
   console.log('  stop                Stop the active strategy');
-  console.log('  sim on|off          Enable or disable simulated execution');
-  console.log('  trade on|off        Enable or disable real PumpPortal trading');
   console.log('  help                Show this help section');
   console.log('  exit                Quit Caterkiller');
 }
@@ -122,27 +214,45 @@ function round(value, precision = 6) {
   return Math.round((Number(value) || 0) * multiplier) / multiplier;
 }
 
+function formatSolAmount(value, precision = 9) {
+  const num = Number(value || 0);
+  if (!Number.isFinite(num)) {
+    return 'n/a';
+  }
+
+  const formatted = num.toFixed(precision);
+  return formatted.replace(/(\.\d*?[1-9])0+$/, '$1').replace(/\.0+$/, '');
+}
+
 function extractPrice(event) {
   if (!event || typeof event !== 'object') return 0;
 
-  const candidateKeys = [
-    'price', 'solPrice', 'tokenPrice', 'token_price', 'amountSol', 'amount_sol',
-    'solanaPrice', 'solana_price', 'usdPrice', 'marketPrice'
-  ];
-
-  for (const key of candidateKeys) {
-    if (event[key] !== undefined && event[key] !== null && Number(event[key]) > 0) {
-      return Number(event[key]);
+  if (Array.isArray(event)) {
+    for (const entry of event) {
+      const found = extractPrice(entry);
+      if (found > 0) return found;
     }
+    return 0;
   }
 
-  const nested = event.data || event.payload || event.message;
-  if (nested && typeof nested === 'object') {
-    return extractPrice(nested);
+  const directPrice = Number(event.price ?? event.solPrice ?? event.tokenPrice ?? event.lastPrice ?? event.currentPrice);
+  if (Number.isFinite(directPrice) && directPrice > 0) {
+    return directPrice;
   }
 
-  if (event.amount && event.amountOut) {
-    return Number(event.amount) / Number(event.amountOut || 1);
+  const solAmount = Number(event.solAmount ?? event.amountSol ?? event.amount_sol);
+  const tokenAmount = Number(event.tokenAmount ?? event.token_amount ?? event.tokens ?? event.amountOut ?? event.amount_out);
+  if (Number.isFinite(solAmount) && solAmount > 0 && Number.isFinite(tokenAmount) && tokenAmount > 0) {
+    return solAmount / tokenAmount;
+  }
+
+  const nestedCandidates = ['data', 'payload', 'message', 'result'];
+  for (const key of nestedCandidates) {
+    const nested = event[key];
+    if (nested && typeof nested === 'object') {
+      const found = extractPrice(nested);
+      if (found > 0) return found;
+    }
   }
 
   return 0;
@@ -171,43 +281,52 @@ function updatePosition(action, amountSol, tokenQty, pricePerToken) {
 }
 
 function recalcPnL() {
-  if (!state.position.tokens) {
+  if (!state.position.tokens || !Number.isFinite(Number(state.currentPrice))) {
     return 0;
   }
 
-  const currentValue = state.currentPrice * state.position.tokens;
-  return currentValue - state.position.totalCostSol + state.position.realizedPnL;
+  const currentValue = Number(state.currentPrice) * state.position.tokens;
+  return currentValue - state.position.totalCostSol;
+}
+
+function formatPrice(value, unit = 'SOL') {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) {
+    return 'no price';
+  }
+  return formatSolAmount(num, 9) + ' ' + unit;
 }
 
 function formatCachedPrice() {
-  const value = Number(state.currentPrice);
-  if (!Number.isFinite(value) || value <= 0) {
-    return 'no price';
-  }
-  return value.toFixed(6) + ' SOL';
+  return formatPrice(state.currentPrice, 'SOL');
 }
 
-function renderTickerLine() {
-  const message = 'Ticker: ' + formatCachedPrice() + ' | mint=' + (state.mint || '<none>');
-  if (state.rl && typeof state.rl.line === 'string' && state.rl.line.length > 0) {
+function renderStatusBanner(force = false) {
+  if (state.liveConfirmationPending) {
     return;
   }
-  console.log(message);
-}
 
-function renderStatusBanner() {
   if (state.rl && typeof state.rl.line === 'string' && state.rl.line.length > 0) {
     return;
   }
 
-  const feed = state.liveStreamReady ? 'feed live' : 'feed idle';
-  const mode = state.strategyRunning ? 'running' : 'stopped';
+  const now = Date.now();
+  if (!force && now - state.lastStatusRenderAt < state.statusRenderThrottleMs) {
+    return;
+  }
+
+  const feed = state.liveStreamReady ? 'feed connected' : 'feed idle';
+  const mode = state.botRunning ? 'bot running' : 'bot stopped';
   const price = formatCachedPrice();
   const message = 'status: mode=' + mode + ' | ' + feed + ' | price=' + price + ' | mint=' + (state.mint || '<none>');
   console.log(message);
+  state.lastStatusRenderAt = now;
 }
 
 function renderStrategyTick() {
+  if (state.liveConfirmationPending) {
+    return;
+  }
   if (!state.liveStreamReady || !state.mint) {
     return;
   }
@@ -215,26 +334,6 @@ function renderStrategyTick() {
     return;
   }
   renderStatusBanner();
-}
-
-function setTicker(enabled) {
-  state.tickerEnabled = enabled;
-
-  if (enabled) {
-    if (state.tickerTimer) return;
-    state.tickerTimer = setInterval(() => {
-      if (!state.tickerEnabled) return;
-      renderStatusBanner();
-    }, 2000);
-    renderStatusBanner();
-    return;
-  }
-
-  if (state.tickerTimer) {
-    clearInterval(state.tickerTimer);
-    state.tickerTimer = null;
-  }
-  console.log('Ticker disabled.');
 }
 
 async function getWalletBalance() {
@@ -276,10 +375,22 @@ async function getWalletBalance() {
   }
 }
 
-function formatMoney(value) {
+function formatMoney(value, options = {}) {
   const num = Number(value || 0);
   if (!Number.isFinite(num)) return 'n/a';
-  return '$' + new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(num);
+
+  const minimumFractionDigits = Number.isFinite(options.minimumFractionDigits) ? options.minimumFractionDigits : 2;
+  const maximumFractionDigits = Number.isFinite(options.maximumFractionDigits) ? options.maximumFractionDigits : 4;
+
+  return '$' + new Intl.NumberFormat('en-US', {
+    minimumFractionDigits,
+    maximumFractionDigits,
+  }).format(num);
+}
+
+function recordPumpPortalCall() {
+  state.pumpPortalApiCalls += 1;
+  state.lastPumpPortalApiCallAt = Date.now();
 }
 
 async function getMarketCap() {
@@ -291,6 +402,7 @@ async function getMarketCap() {
   const url = 'https://frontend-api-v3.pump.fun/coins-v2/' + encodeURIComponent(state.mint);
 
   try {
+    recordPumpPortalCall();
     const response = await fetch(url, {
       headers: {
         Accept: 'application/json',
@@ -324,74 +436,210 @@ async function getMarketCap() {
   }
 }
 
-function showStatus() {
-  console.log('\nStatus');
+async function ensureSolanaUsdPrice() {
+  if (Number.isFinite(state.solanaUsdPrice) && state.solanaUsdPrice > 0) {
+    return state.solanaUsdPrice;
+  }
+
+  try {
+    const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    if (!response.ok) {
+      state.solanaUsdPrice = 0;
+      return 0;
+    }
+    const json = await response.json();
+    const value = Number(json && json.solana && json.solana.usd);
+    if (!Number.isFinite(value) || value <= 0) {
+      state.solanaUsdPrice = 0;
+      return 0;
+    }
+    state.solanaUsdPrice = value;
+    return value;
+  } catch (error) {
+    state.solanaUsdPrice = 0;
+    return 0;
+  }
+}
+
+function getProfitUsd() {
+  const pnlSol = Number((state.position.realizedPnL || 0) + (recalcPnL() || 0));
+  if (!Number.isFinite(pnlSol)) {
+    return null;
+  }
+
+  if (!Number.isFinite(state.solanaUsdPrice) || state.solanaUsdPrice <= 0) {
+    return null;
+  }
+
+  return pnlSol * state.solanaUsdPrice;
+}
+
+async function getTokenDisplayName() {
+  if (!state.mint) {
+    return 'none';
+  }
+
+  try {
+    const response = await fetch('https://frontend-api-v3.pump.fun/coins-v2/' + encodeURIComponent(state.mint), {
+      headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (!response.ok) {
+      return 'n/a';
+    }
+
+    const payload = await response.json();
+    return payload && payload.symbol ? payload.symbol : 'n/a';
+  } catch (error) {
+    return 'n/a';
+  }
+}
+
+async function showStatus() {
+  await ensureSolanaUsdPrice();
+  const profitUsd = getProfitUsd();
+  const tokenName = await getTokenDisplayName();
+  const stats = getRecentPriceStats();
+  const strategyInfo = STRATEGIES[state.strategy] || 'Custom strategy';
+
+  console.log('\nStatus dump:');
   console.log('  strategy:          ' + state.strategy);
-  console.log('  strategy running:  ' + (state.strategyRunning ? 'yes' : 'no'));
-  console.log('  feed:              ' + (state.liveStreamReady ? 'live' : 'idle'));
+  console.log('  bot running:       ' + (state.botRunning ? 'yes' : 'no'));
+  console.log('  mode:              ' + (state.mode === 'sim' ? 'simulation' : 'live'));
+  console.log('  feed:              ' + (state.liveStreamReady ? 'connected' : 'idle'));
   console.log('  mint:              ' + (state.mint || '<none>'));
-  console.log('  simulation:        ' + (state.simulation ? 'on' : 'off'));
-  console.log('  trade mode:        ' + (state.trade ? 'real trade on' : 'dry run'));
+  console.log('  price calls:       ' + state.pumpPortalApiCalls);
+  console.log('  last api call:     ' + (state.lastPumpPortalApiCallAt ? new Date(state.lastPumpPortalApiCallAt).toISOString() : 'never'));
   console.log('  api key:           ' + (state.apiKey ? 'loaded' : 'missing'));
   console.log('  wallet key:        ' + (state.publicWallet ? 'loaded' : 'missing'));
-  console.log('  last price:        ' + formatCachedPrice());
-  console.log('  avg cost:          ' + round(state.position.averageCostSol, 6) + ' SOL/token');
-  console.log('  tokens:            ' + round(state.position.tokens, 6));
-  console.log('  total cost:        ' + round(state.position.totalCostSol, 6) + ' SOL');
-  console.log('  realized PnL:      ' + round(state.position.realizedPnL, 6) + ' SOL');
-  console.log('  unrealized PnL:    ' + round(recalcPnL(), 6) + ' SOL');
+  console.log('  strategy info:     ' + strategyInfo);
+  console.log('  interval:          ' + (state.strategy === 'dca' ? (state.dcaIntervalMs / 1000) + 's' : 'n/a'));
+  console.log('  buy amount:        ' + (state.strategy === 'dca' ? state.dcaAmountSol + ' SOL' : 'n/a'));
+  console.log('  price trend:       ' + stats.changePct.toFixed(3) + '%');
+  console.log('  price avg:         ' + formatPrice(stats.avg, 'SOL'));
+  console.log('  last price:        ' + formatPrice(state.currentPrice, 'SOL'));
+  console.log('  avg cost basis:    ' + formatPrice(state.position.averageCostSol, 'SOL/token'));
+  console.log('  tokens:            ' + formatSolAmount(state.position.tokens, 9) + ' ' + tokenName);
+  console.log('  total cost:        ' + formatSolAmount(state.position.totalCostSol, 9) + ' SOL');
+  console.log('  realized PnL:      ' + formatSolAmount(state.position.realizedPnL, 9) + ' SOL');
+  console.log('  unrealized PnL:    ' + formatSolAmount(recalcPnL(), 9) + ' SOL');
+  console.log('  profit:            ' + (profitUsd === null ? 'n/a' : formatMoney(profitUsd, { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + ' USD'));
+  console.log('  holdings:          ' + (state.position.tokens > 0 ? formatMoney((state.position.tokens * Number(state.currentPrice || 0)) * state.solanaUsdPrice, { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + ' USD' : '$0.00 USD'));
+}
+
+function getRecentPriceStats() {
+  const prices = state.priceHistory.slice(-12);
+  if (prices.length < 2) {
+    return { avg: state.currentPrice || 0, last: state.currentPrice || 0, high: state.currentPrice || 0, low: state.currentPrice || 0, changePct: 0 };
+  }
+
+  const first = prices[0];
+  const last = prices[prices.length - 1];
+  const avg = prices.reduce((sum, value) => sum + Number(value || 0), 0) / prices.length;
+  const high = Math.max(...prices);
+  const low = Math.min(...prices);
+  const changePct = first > 0 ? ((last - first) / first) * 100 : 0;
+
+  return { avg, last, high, low, changePct };
+}
+
+function getSignalScore() {
+  if (!state.currentPrice) {
+    return 0;
+  }
+
+  const stats = getRecentPriceStats();
+  const last = Number(state.currentPrice || 0);
+  const prev = Number(state.lastPrice || stats.last || last);
+  const momentumPct = prev > 0 ? ((last - prev) / prev) * 100 : 0;
+  const shortTrendPct = stats.avg > 0 ? ((last - stats.avg) / stats.avg) * 100 : 0;
+
+  if (state.strategy === 'dca') {
+    return 0;
+  }
+
+  if (state.strategy === 'momentum') {
+    return momentumPct * 2 + shortTrendPct;
+  }
+
+  if (state.strategy === 'meanReversion') {
+    return (stats.avg > 0 ? ((last - stats.avg) / stats.avg) * 100 : 0) * -1;
+  }
+
+  if (state.strategy === 'breakout') {
+    const breakout = stats.high > 0 ? ((last - stats.high) / stats.high) * 100 : 0;
+    return breakout * 10;
+  }
+
+  return 0;
 }
 
 function showStrategy() {
   const active = STRATEGIES[state.strategy] || 'Custom strategy';
-  console.log('\nStrategy');
-  console.log('  active:            ' + state.strategy);
-  console.log('  running:           ' + (state.strategyRunning ? 'yes' : 'no'));
-  console.log('  feed:              ' + (state.liveStreamReady ? 'live' : 'idle'));
+  const stats = getRecentPriceStats();
+  console.log('\nPosition snapshot');
+  console.log('  strategy:          ' + state.strategy);
+  console.log('  trading:           ' + (state.botRunning ? 'yes' : 'no'));
+  console.log('  feed:              ' + (state.liveStreamReady ? 'connected' : 'idle'));
   console.log('  mint:              ' + (state.mint || '<none>'));
+  console.log('  price calls:       ' + state.pumpPortalApiCalls);
+  console.log('  last api call:     ' + (state.lastPumpPortalApiCallAt ? new Date(state.lastPumpPortalApiCallAt).toISOString() : 'never'));
   console.log('  interval:          ' + (state.strategy === 'dca' ? (state.dcaIntervalMs / 1000) + 's' : 'n/a'));
   console.log('  buy amount:        ' + (state.strategy === 'dca' ? state.dcaAmountSol + ' SOL' : 'n/a'));
-  console.log('  details:           ' + active);
+  console.log('  price trend:       ' + stats.changePct.toFixed(3) + '%');
+  console.log('  price avg:         ' + formatPrice(stats.avg, 'SOL'));
+  console.log('  strategy info:     ' + active);
 }
 
 function setStrategy(name) {
   const key = String(name || '').trim().toLowerCase();
   if (!key || !STRATEGIES[key]) {
-    console.log('Unknown strategy. Available: ' + Object.keys(STRATEGIES).join(', '));
+    logError('Unknown strategy. Available: ' + Object.keys(STRATEGIES).join(', '));
     return;
   }
   state.strategy = key;
-  console.log('Strategy set to: ' + key);
+  if (state.strategy === 'dca') {
+    state.dcaLastBuyAt = 0;
+  }
+  if (state.rl) {
+    resetPromptPrefix();
+  }
+  logInfo('Strategy set to: ' + key);
 }
 
 function startStrategy(name) {
   const key = String(name || '').trim().toLowerCase() || state.strategy;
   if (!STRATEGIES[key]) {
-    console.log('Unknown strategy. Available: ' + Object.keys(STRATEGIES).join(', '));
+    logError('Unknown strategy. Available: ' + Object.keys(STRATEGIES).join(', '));
     return;
   }
 
-  if (state.strategyRunning) {
-    console.log('Strategy already running: ' + state.strategy);
+  if (state.botRunning) {
+    logWarning('Bot already running.');
     return;
   }
 
   state.strategy = key;
-  state.strategyRunning = true;
+  state.botRunning = true;
   if (state.strategy === 'dca') {
     state.dcaLastBuyAt = 0;
   }
-  console.log('Started strategy: ' + key);
+  if (state.rl) {
+    resetPromptPrefix();
+  }
+  logSuccess('Bot started.');
 }
 
 function stopStrategy() {
-  if (!state.strategyRunning) {
-    console.log('Strategy is not running.');
+  if (!state.botRunning) {
+    logWarning('Nothing to stop, not running.');
     return;
   }
 
-  state.strategyRunning = false;
-  console.log('Stopped strategy.');
+  state.botRunning = false;
+  if (state.rl) {
+    resetPromptPrefix();
+  }
+  logInfo('Bot stopped.');
 }
 
 async function tradeRequest(action, mint, amount, denominatedInSol, slippage = 10) {
@@ -412,6 +660,7 @@ async function tradeRequest(action, mint, amount, denominatedInSol, slippage = 1
   };
 
   const url = 'https://pumpportal.fun/api/trade?api-key=' + encodeURIComponent(state.apiKey);
+  recordPumpPortalCall();
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -433,16 +682,16 @@ async function buy(solAmount) {
     return;
   }
 
-  const amount = Number(solAmount) || 0.01;
-  const quotePrice = state.currentPrice || 0.000001;
+  const amount = Number(solAmount) || PLACEHOLDER_DEFAULTS.BUY_SOL;
+  const quotePrice = state.currentPrice || PLACEHOLDER_DEFAULTS.SOL_PRICE;
   const tokens = amount / quotePrice;
 
-  if (state.simulation || !state.trade) {
+  if (state.mode !== 'live') {
     console.log('Simulation buy: ' + amount + ' SOL on mint ' + state.mint);
     updatePosition('buy', amount, tokens, quotePrice);
     state.currentPrice = state.currentPrice || quotePrice;
-    console.log('  avg cost: ' + round(state.position.averageCostSol, 6) + ' SOL/token');
-    console.log('  pnl now: ' + round(recalcPnL(), 6) + ' SOL');
+    console.log('  cost basis: ' + formatPrice(state.position.averageCostSol, 'SOL/token'));
+    console.log('  PnL now: ' + formatSolAmount(recalcPnL(), 9) + ' SOL');
     return { fake: true };
   }
 
@@ -463,9 +712,9 @@ async function sell(sellPercent = 100) {
   const total = state.position.tokens || 0;
   const percent = Number(sellPercent) || 100;
   const targetTokens = total * (percent / 100);
-  const price = state.currentPrice || state.position.averageCostSol || 0.000001;
+  const price = state.currentPrice || state.position.averageCostSol || PLACEHOLDER_DEFAULTS.SOL_PRICE;
 
-  if (state.simulation || !state.trade) {
+  if (state.mode !== 'live') {
     console.log('Simulation sell: ' + percent + '% of current mint position');
     updatePosition('sell', 0, targetTokens, price);
     console.log('  remaining tokens: ' + round(state.position.tokens, 6));
@@ -481,14 +730,33 @@ async function sell(sellPercent = 100) {
   return result;
 }
 
+function debugTradeSignal(message) {
+  if (!state.debug) return;
+  console.log('[debug] ' + message);
+}
+
 function logStrategyAction(action, amountSol) {
   const readableAmount = Number.isFinite(Number(amountSol)) ? Number(amountSol).toFixed(6) + ' SOL' : 'configured amount';
-  console.log('[strategy] ' + state.strategy + ' -> ' + action.toUpperCase() + ' ' + readableAmount);
+  const summary = '[strategy] ' + state.strategy + ' -> ' + action.toUpperCase() + ' ' + readableAmount;
+  debugTradeSignal(summary + ' | price=' + (state.currentPrice != null ? state.currentPrice : 'n/a') + ' | last=' + (state.lastPrice != null ? state.lastPrice : 'n/a'));
+  console.log(summary);
+}
+
+function recordPriceSample(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return;
+  }
+
+  state.priceHistory.push(Number(value));
+  if (state.priceHistory.length > 20) {
+    state.priceHistory.shift();
+  }
 }
 
 function evaluateSignal() {
   if (state.strategy === 'dca') {
-    if (!state.currentPrice) {
+    const knownPrice = Number(state.currentPrice || state.lastPrice || 0);
+    if (!Number.isFinite(knownPrice) || knownPrice <= 0) {
       return null;
     }
 
@@ -506,33 +774,56 @@ function evaluateSignal() {
     return null;
   }
 
-  if (!state.currentPrice || !state.lastPrice) {
+  if (!state.currentPrice) {
     return null;
   }
 
-  const delta = state.currentPrice - state.lastPrice;
-  const pct = state.lastPrice > 0 ? (delta / state.lastPrice) * 100 : 0;
+  recordPriceSample(state.currentPrice);
+
+  const score = getSignalScore();
+  const now = Date.now();
+  if (state.lastSignalAt && now - state.lastSignalAt < state.strategyCooldownMs) {
+    return null;
+  }
 
   if (state.strategy === 'momentum') {
-    if (pct > 0.5) return 'buy';
-    if (pct < -0.5) return 'sell';
+    if (score >= 0.5) {
+      state.lastSignalAt = now;
+      return 'buy';
+    }
+    if (score <= -0.5) {
+      state.lastSignalAt = now;
+      return 'sell';
+    }
   }
 
   if (state.strategy === 'meanReversion') {
-    if (pct < -1.5) return 'buy';
-    if (pct > 1.5) return 'sell';
+    if (score >= 0.8) {
+      state.lastSignalAt = now;
+      return 'sell';
+    }
+    if (score <= -0.8) {
+      state.lastSignalAt = now;
+      return 'buy';
+    }
   }
 
   if (state.strategy === 'breakout') {
-    if (pct > 1.0) return 'buy';
-    if (pct < -1.0) return 'sell';
+    if (score >= 1.0) {
+      state.lastSignalAt = now;
+      return 'buy';
+    }
+    if (score <= -1.0) {
+      state.lastSignalAt = now;
+      return 'sell';
+    }
   }
 
   return null;
 }
 
 async function maybeAutoTrade() {
-  if (!state.strategyRunning) {
+  if (!state.botRunning) {
     return;
   }
 
@@ -540,15 +831,25 @@ async function maybeAutoTrade() {
     return;
   }
 
-  if (!state.currentPrice || state.lastPrice === 0) {
+  const knownPrice = Number(state.currentPrice || state.lastPrice || 0);
+  if (!Number.isFinite(knownPrice) || knownPrice <= 0) {
     return;
   }
 
   const signal = evaluateSignal();
-  if (!signal) return;
+  if (!signal) {
+    if (state.debug) {
+      debugTradeSignal('signal rejected: strategy=' + state.strategy + ' | price=' + (state.currentPrice != null ? state.currentPrice : 'n/a') + ' | last=' + (state.lastPrice != null ? state.lastPrice : 'n/a'));
+    }
+    return;
+  }
+
+  if (state.debug) {
+    debugTradeSignal('trade signal accepted: strategy=' + state.strategy + ' | signal=' + signal + ' | price=' + (state.currentPrice != null ? state.currentPrice : 'n/a'));
+  }
 
   if (signal === 'buy') {
-    const amount = state.strategy === 'dca' ? state.dcaAmountSol : 0.01;
+    const amount = state.strategy === 'dca' ? state.dcaAmountSol : PLACEHOLDER_DEFAULTS.BUY_SOL;
     logStrategyAction('buy', amount);
     await buy(amount);
   }
@@ -591,9 +892,6 @@ async function connectRealtime() {
       if (price) {
         state.lastPrice = Number(state.currentPrice) > 0 ? state.currentPrice : price;
         state.currentPrice = price;
-        if (state.tickerEnabled) {
-          renderTickerLine();
-        }
         await maybeAutoTrade();
         renderStrategyTick();
       }
@@ -625,7 +923,7 @@ async function commandLoop() {
 
   state.rl = rl;
 
-  rl.setPrompt('caterkiller> ');
+  resetPromptPrefix();
   rl.prompt();
 
   rl.on('line', async (raw) => {
@@ -636,6 +934,21 @@ async function commandLoop() {
     }
 
     const lower = input.toLowerCase();
+
+    if (state.liveConfirmationPending) {
+      if (input.toUpperCase() === 'ARM') {
+        state.mode = 'live';
+        state.liveConfirmationPending = false;
+        resetPromptPrefix();
+        logSuccess('Mode set to: live');
+      } else {
+        state.liveConfirmationPending = false;
+        resetPromptPrefix();
+        logError('You did not type `arm`.');
+      }
+      rl.prompt();
+      return;
+    }
 
     if (lower === 'help') {
       printHelp();
@@ -649,13 +962,13 @@ async function commandLoop() {
       return;
     }
 
-    if (lower === 'status') {
-      showStatus();
+    if (lower === 'status' || lower === 'position' || lower === 'pos' || lower === 'info' || lower === 'dump') {
+      await showStatus();
       rl.prompt();
       return;
     }
 
-    if (lower === 'balance') {
+    if (lower === 'balance' || lower === 'wallet') {
       await getWalletBalance();
       rl.prompt();
       return;
@@ -667,132 +980,67 @@ async function commandLoop() {
       return;
     }
 
-    if (lower === 'ticker') {
-      console.log('Ticker: ' + (state.tickerEnabled ? 'on' : 'off'));
+    if (lower === 'debug') {
+      state.debug = !state.debug;
+      console.log('Verbose trade debug: ' + (state.debug ? 'on' : 'off'));
       rl.prompt();
       return;
     }
 
-    if (lower === 'ticker on') {
-      setTicker(true);
+    if (lower === 'strategy' || lower === 'strat') {
+      console.log('Available strategies: ' + Object.keys(STRATEGIES).join(', '));
       rl.prompt();
       return;
     }
 
-    if (lower === 'ticker off') {
-      setTicker(false);
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'price') {
-      console.log('Current price: ' + formatCachedPrice());
-      rl.prompt();
-      return;
-    }
-
-    if (lower.startsWith('price ')) {
-      const parsed = Number(input.slice('price '.length).trim());
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        console.log('Usage: price [SOL]');
-      } else {
-        state.lastPrice = Number(state.currentPrice) > 0 ? state.currentPrice : parsed;
-        state.currentPrice = parsed;
-        if (state.tickerEnabled) {
-          renderTickerLine();
-        }
-        console.log('Price set to: ' + parsed.toFixed(6) + ' SOL');
-      }
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'strategy') {
-      showStrategy();
-      rl.prompt();
-      return;
-    }
-
-    if (lower.startsWith('strategy ')) {
-      const name = input.slice('strategy '.length).trim();
+    if (lower.startsWith('strategy ') || lower.startsWith('strat ')) {
+      const prefix = lower.startsWith('strategy ') ? 'strategy ' : 'strat ';
+      const name = input.slice(prefix.length).trim();
       setStrategy(name);
       rl.prompt();
       return;
     }
 
-      if (lower === 'start') {
-        startStrategy();
+    if (lower === 'start') {
+      startStrategy();
       rl.prompt();
       return;
     }
 
-      if (lower.startsWith('start ')) {
-      startStrategy(input.slice(input.indexOf(' ') + 1).trim());
+    if (lower === 'stop') {
+      stopStrategy();
       rl.prompt();
       return;
     }
 
-      if (lower === 'stop') {
-        stopStrategy();
+    if (lower === 'live') {
+      const nextMode = state.mode === 'live' ? 'sim' : 'live';
+      setMode(nextMode);
       rl.prompt();
       return;
     }
 
-      if (lower.startsWith('stop ')) {
-        stopStrategy();
+    if (lower === 'live on') {
+      setMode('live');
       rl.prompt();
       return;
     }
 
-    if (lower === 'sim') {
-      console.log('Simulation: ' + (state.simulation ? 'on' : 'off'));
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'sim on') {
-      state.simulation = true;
-      console.log('Simulation on.');
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'sim off') {
-      state.simulation = false;
-      console.log('Simulation off.');
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'trade') {
-      console.log('Trade mode: ' + (state.trade ? 'on' : 'off'));
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'trade on') {
-      state.trade = true;
-      console.log('Real trade mode on.');
-      rl.prompt();
-      return;
-    }
-
-    if (lower === 'trade off') {
-      state.trade = false;
-      console.log('Real trade mode off.');
+    if (lower === 'live off') {
+      setMode('sim');
       rl.prompt();
       return;
     }
 
     if (lower === 'buy') {
-      await buy('0.01');
+      await buy(String(PLACEHOLDER_DEFAULTS.BUY_SOL));
       rl.prompt();
       return;
     }
 
     if (lower.startsWith('buy ')) {
       const amount = input.slice('buy '.length).trim();
-      await buy(amount || '0.01');
+      await buy(amount || String(PLACEHOLDER_DEFAULTS.BUY_SOL));
       rl.prompt();
       return;
     }
@@ -827,7 +1075,7 @@ async function commandLoop() {
       return;
     }
 
-    console.log('Unknown command. Type "help" for commands.');
+    logWarning('Unknown command. Type `help` for commands.');
     rl.prompt();
   });
 
@@ -846,6 +1094,5 @@ async function commandLoop() {
     console.log('Booted with mint: <none>');
   }
   await connectRealtime();
-  if (state.tickerEnabled) setTicker(true);
   await commandLoop();
 })();
