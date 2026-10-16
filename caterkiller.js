@@ -64,7 +64,7 @@ const state = {
   lastSignalAt: 0,
   strategyCooldownMs: 10 * 1000,
   dcaIntervalMs: 60 * 1000,
-  dcaAmountSol: PLACEHOLDER_DEFAULTS.DCA_SOL,
+  buyAmountSol: PLACEHOLDER_DEFAULTS.DCA_SOL,
   dcaLastBuyAt: 0,
   pumpPortalApiCalls: 0,
   lastPumpPortalApiCallAt: null,
@@ -81,7 +81,32 @@ const state = {
   websocket: null,
   liveStreamReady: false,
   debug: false,
+  shuttingDown: false,
+  lastSubscribedMint: '',
+  websocketMessageCount: 0,
+  metaFilePath: path.join(__dirname, '.api_fees'),
 };
+
+function loadPersistedApiFeeSummary() {
+  try {
+    if (!fs.existsSync(state.metaFilePath)) {
+      return;
+    }
+
+    const raw = fs.readFileSync(state.metaFilePath, 'utf8');
+    const match = raw.match(/messages_received:\s*([0-9]+)/i);
+    if (!match) {
+      return;
+    }
+
+    const value = Number(match[1]);
+    if (Number.isFinite(value) && value >= 0) {
+      state.websocketMessageCount = value;
+    }
+  } catch (error) {
+    // Ignore unreadable or stale metadata; start from zero.
+  }
+}
 
 function parseBoolean(value) {
   if (typeof value === 'boolean') return value;
@@ -164,12 +189,12 @@ function fillStateFromEnv() {
   state.publicWallet = (env.PUBLIC_WALLET_KEY || '').trim();
   state.mint = (env.MINT || '').trim();
   state.dcaIntervalMs = Number(env.DCA_INTERVAL_MS || env.DCA_INTERVAL || 60000);
-  state.dcaAmountSol = Number(env.DCA_AMOUNT_SOL || env.DCA_AMOUNT || PLACEHOLDER_DEFAULTS.DCA_SOL);
+  state.buyAmountSol = Number(env.DCA_AMOUNT_SOL || env.DCA_AMOUNT || PLACEHOLDER_DEFAULTS.DCA_SOL);
   if (!Number.isFinite(state.dcaIntervalMs) || state.dcaIntervalMs <= 0) {
     state.dcaIntervalMs = 60 * 1000;
   }
-  if (!Number.isFinite(state.dcaAmountSol) || state.dcaAmountSol <= 0) {
-    state.dcaAmountSol = PLACEHOLDER_DEFAULTS.DCA_SOL;
+  if (!Number.isFinite(state.buyAmountSol) || state.buyAmountSol <= 0) {
+    state.buyAmountSol = PLACEHOLDER_DEFAULTS.DCA_SOL;
   }
 
   if (!env.STRATEGY && !env.WATCHLIST) {
@@ -182,16 +207,13 @@ function printHelp() {
   console.log('  <MINT>              Set the current mint address');
   console.log('  live                Toggle live mode on/off');
   console.log('  buy [SOL]           Buy the current mint using SOL amount');
+  console.log('  buyamt [SOL]        Set the strategy buy amount (used by DCA / auto buys)');
   console.log('  sell [PERCENT]      Sell 100% of the current mint position');
-  console.log('  balance             Show the current SOL balance for the configured wallet');
-  console.log('  wallet              Alias for balance');
+  console.log('  wallet              Show the current SOL balance for the configured wallet');
   console.log('  mcap                Show the current mint market cap from PumpPortal/Pump.fun');
-  console.log('  position            Show current position, bot state, and account snapshot');
-  console.log('  pos                 Alias for position');
-  console.log('  info                Alias for position');
-  console.log('  strategy [NAME]     Set the active strategy');
-  console.log('  strat [NAME]        Alias for strategy');
-  console.log('  debug              Toggle verbose trade-signal logging');
+  console.log('  pos                 Show current position, bot state, and account snapshot');
+  console.log('  strat [NAME]        Set the active strategy');
+  console.log('  dbg                 Toggle verbose trade-signal logging');
   console.log('  start               Start the active strategy');
   console.log('  stop                Stop the active strategy');
   console.log('  help                Show this help section');
@@ -318,7 +340,8 @@ function renderStatusBanner(force = false) {
   const feed = state.liveStreamReady ? 'feed connected' : 'feed idle';
   const mode = state.botRunning ? 'bot running' : 'bot stopped';
   const price = formatCachedPrice();
-  const message = 'status: mode=' + mode + ' | ' + feed + ' | price=' + price + ' | mint=' + (state.mint || '<none>');
+  const wsCost = state.websocketMessageCount / 10000;
+  const message = 'status: mode=' + mode + ' | ' + feed + ' | price=' + price + ' | ws msgs=' + state.websocketMessageCount + ' (~$' + round(wsCost, 6) + ' @ $1/10k) | mint=' + (state.mint || '<none>');
   console.log(message);
   state.lastStatusRenderAt = now;
 }
@@ -381,11 +404,13 @@ function formatMoney(value, options = {}) {
 
   const minimumFractionDigits = Number.isFinite(options.minimumFractionDigits) ? options.minimumFractionDigits : 2;
   const maximumFractionDigits = Number.isFinite(options.maximumFractionDigits) ? options.maximumFractionDigits : 4;
+  const sign = num < 0 ? '-' : '';
+  const abs = Math.abs(num);
 
-  return '$' + new Intl.NumberFormat('en-US', {
+  return sign + '$' + new Intl.NumberFormat('en-US', {
     minimumFractionDigits,
     maximumFractionDigits,
-  }).format(num);
+  }).format(abs);
 }
 
 function recordPumpPortalCall() {
@@ -474,24 +499,51 @@ function getProfitUsd() {
   return pnlSol * state.solanaUsdPrice;
 }
 
-async function getTokenDisplayName() {
-  if (!state.mint) {
+function formatPercent(value) {
+  if (!Number.isFinite(value)) return 'n/a';
+  const sign = value >= 0 ? '+' : '-';
+  return sign + Math.abs(value).toFixed(2) + '%';
+}
+
+function getPositionPerformance() {
+  const pnlSol = Number((state.position.realizedPnL || 0) + (recalcPnL() || 0));
+  const costBasis = Number(state.position.totalCostSol || 0);
+  if (!Number.isFinite(pnlSol) || !Number.isFinite(costBasis) || costBasis <= 0) {
+    return { pct: null, multiple: null };
+  }
+
+  const pct = (pnlSol / costBasis) * 100;
+  const value = Number(state.currentPrice || 0) * Number(state.position.tokens || 0);
+  const multiple = costBasis > 0 ? (value + Math.max(0, state.position.realizedPnL || 0)) / costBasis : null;
+
+  return {
+    pct,
+    multiple: Number.isFinite(multiple) ? multiple : null,
+  };
+}
+
+async function getTokenDisplayNameForMint(mint) {
+  if (!mint) {
     return 'none';
   }
 
   try {
-    const response = await fetch('https://frontend-api-v3.pump.fun/coins-v2/' + encodeURIComponent(state.mint), {
+    const response = await fetch('https://frontend-api-v3.pump.fun/coins-v2/' + encodeURIComponent(mint), {
       headers: { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0' },
     });
     if (!response.ok) {
-      return 'n/a';
+      return mint.slice(0, 6).toUpperCase();
     }
 
     const payload = await response.json();
-    return payload && payload.symbol ? payload.symbol : 'n/a';
+    return payload && payload.symbol ? payload.symbol : mint.slice(0, 6).toUpperCase();
   } catch (error) {
-    return 'n/a';
+    return mint.slice(0, 6).toUpperCase();
   }
+}
+
+async function getTokenDisplayName() {
+  return getTokenDisplayNameForMint(state.mint);
 }
 
 async function showStatus() {
@@ -500,9 +552,9 @@ async function showStatus() {
   const tokenName = await getTokenDisplayName();
   const stats = getRecentPriceStats();
   const strategyInfo = STRATEGIES[state.strategy] || 'Custom strategy';
+  const performance = getPositionPerformance();
 
   console.log('\nStatus dump:');
-  console.log('  strategy:          ' + state.strategy);
   console.log('  bot running:       ' + (state.botRunning ? 'yes' : 'no'));
   console.log('  mode:              ' + (state.mode === 'sim' ? 'simulation' : 'live'));
   console.log('  feed:              ' + (state.liveStreamReady ? 'connected' : 'idle'));
@@ -511,9 +563,10 @@ async function showStatus() {
   console.log('  last api call:     ' + (state.lastPumpPortalApiCallAt ? new Date(state.lastPumpPortalApiCallAt).toISOString() : 'never'));
   console.log('  api key:           ' + (state.apiKey ? 'loaded' : 'missing'));
   console.log('  wallet key:        ' + (state.publicWallet ? 'loaded' : 'missing'));
+  console.log('  strat:             ' + state.strategy);
   console.log('  strategy info:     ' + strategyInfo);
   console.log('  interval:          ' + (state.strategy === 'dca' ? (state.dcaIntervalMs / 1000) + 's' : 'n/a'));
-  console.log('  buy amount:        ' + (state.strategy === 'dca' ? state.dcaAmountSol + ' SOL' : 'n/a'));
+  console.log('  buy amount:        ' + (Number.isFinite(state.buyAmountSol) && state.buyAmountSol > 0 ? state.buyAmountSol + ' SOL' : 'n/a'));
   console.log('  price trend:       ' + stats.changePct.toFixed(3) + '%');
   console.log('  price avg:         ' + formatPrice(stats.avg, 'SOL'));
   console.log('  last price:        ' + formatPrice(state.currentPrice, 'SOL'));
@@ -522,6 +575,9 @@ async function showStatus() {
   console.log('  total cost:        ' + formatSolAmount(state.position.totalCostSol, 9) + ' SOL');
   console.log('  realized PnL:      ' + formatSolAmount(state.position.realizedPnL, 9) + ' SOL');
   console.log('  unrealized PnL:    ' + formatSolAmount(recalcPnL(), 9) + ' SOL');
+  console.log('  -------------------')
+  console.log('  gain pct:          ' + (performance.pct === null ? 'n/a' : formatPercent(performance.pct)));
+  console.log('  gain x:            ' + (performance.multiple === null ? 'n/a' : performance.multiple.toFixed(2) + 'x'));
   console.log('  profit:            ' + (profitUsd === null ? 'n/a' : formatMoney(profitUsd, { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + ' USD'));
   console.log('  holdings:          ' + (state.position.tokens > 0 ? formatMoney((state.position.tokens * Number(state.currentPrice || 0)) * state.solanaUsdPrice, { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + ' USD' : '$0.00 USD'));
 }
@@ -577,16 +633,16 @@ function showStrategy() {
   const active = STRATEGIES[state.strategy] || 'Custom strategy';
   const stats = getRecentPriceStats();
   console.log('\nPosition snapshot');
-  console.log('  strategy:          ' + state.strategy);
   console.log('  trading:           ' + (state.botRunning ? 'yes' : 'no'));
   console.log('  feed:              ' + (state.liveStreamReady ? 'connected' : 'idle'));
   console.log('  mint:              ' + (state.mint || '<none>'));
   console.log('  price calls:       ' + state.pumpPortalApiCalls);
   console.log('  last api call:     ' + (state.lastPumpPortalApiCallAt ? new Date(state.lastPumpPortalApiCallAt).toISOString() : 'never'));
   console.log('  interval:          ' + (state.strategy === 'dca' ? (state.dcaIntervalMs / 1000) + 's' : 'n/a'));
-  console.log('  buy amount:        ' + (state.strategy === 'dca' ? state.dcaAmountSol + ' SOL' : 'n/a'));
+  console.log('  buy amount:        ' + (Number.isFinite(state.buyAmountSol) && state.buyAmountSol > 0 ? state.buyAmountSol + ' SOL' : 'n/a'));
   console.log('  price trend:       ' + stats.changePct.toFixed(3) + '%');
   console.log('  price avg:         ' + formatPrice(stats.avg, 'SOL'));
+  console.log('  strat:             ' + state.strategy);
   console.log('  strategy info:     ' + active);
 }
 
@@ -849,7 +905,7 @@ async function maybeAutoTrade() {
   }
 
   if (signal === 'buy') {
-    const amount = state.strategy === 'dca' ? state.dcaAmountSol : PLACEHOLDER_DEFAULTS.BUY_SOL;
+    const amount = Number.isFinite(state.buyAmountSol) && state.buyAmountSol > 0 ? state.buyAmountSol : PLACEHOLDER_DEFAULTS.BUY_SOL;
     logStrategyAction('buy', amount);
     await buy(amount);
   }
@@ -859,56 +915,158 @@ async function maybeAutoTrade() {
   }
 }
 
+function syncMintSubscription() {
+  const socket = state.websocket;
+  if (!socket || socket.readyState !== 1) {
+    return;
+  }
+
+  const currentMint = String(state.mint || '').trim();
+  if (!currentMint) {
+    return;
+  }
+
+  if (state.lastSubscribedMint && state.lastSubscribedMint !== currentMint) {
+    try {
+      socket.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [state.lastSubscribedMint] }));
+    } catch (error) {
+      // Ignore unsubscribe race conditions while switching mints.
+    }
+  }
+
+  if (state.lastSubscribedMint !== currentMint) {
+    try {
+      socket.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [currentMint] }));
+      state.lastSubscribedMint = currentMint;
+    } catch (error) {
+      // Ignore race conditions during a mint switch.
+    }
+  }
+}
+
+function writeMetaSnapshot(reason = 'tick') {
+  const messages = Number(state.websocketMessageCount || 0);
+  const approxUsd = messages * (1 / 10000);
+  const yaml = [
+    'messages_received: ' + messages,
+    'estimated_usd: ' + round(approxUsd, 6),
+    'billing_rule: "$1 per 10000 messages"',
+    'api_fee_estimate_usd: ' + round(approxUsd, 6),
+    'last_updated: ' + new Date().toISOString(),
+    'last_reason: ' + reason,
+    ''
+  ].join('\n');
+
+  try {
+    fs.writeFileSync(state.metaFilePath, yaml, 'utf8');
+  } catch (error) {
+    console.log('Unable to write .meta: ' + String(error && error.message ? error.message : error));
+  }
+}
+
+function cleanupRealtimeSocket() {
+  if (!state.websocket || state.shuttingDown) {
+    return;
+  }
+
+  state.shuttingDown = true;
+  console.log('Tearing down PumpPortal websocket connection cleanly...');
+  writeMetaSnapshot('shutdown');
+
+  try {
+    if (state.mint && state.websocket.readyState === 1) {
+      state.websocket.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [state.mint] }));
+      console.log('Unsubscribed from mint:', state.mint);
+    }
+  } catch (error) {
+    // Ignore unsubscribe race conditions during shutdown.
+  }
+
+  try {
+    if (state.websocket.readyState === 1) {
+      state.websocket.close();
+      console.log('PumpPortal websocket closed.');
+    }
+  } catch (error) {
+    // Ignore close race conditions during shutdown.
+  }
+}
+
 async function connectRealtime() {
   if (!state.apiKey) {
     console.log('Live stream disabled: missing PUMP_API_KEY in .env');
     return null;
   }
 
-  let WebSocketCtor = globalThis.WebSocket;
-  if (!WebSocketCtor) {
-    try {
-      const wsModule = await import('ws');
-      WebSocketCtor = wsModule.WebSocket;
-    } catch (error) {
-      console.log('Node WebSocket support is unavailable; live stream disabled.');
-      return null;
-    }
-  }
+  const WebSocketCtor = globalThis.WebSocket || require('ws');
 
-  const ws = new WebSocketCtor('wss://pumpportal.fun/api/data?api-key=' + encodeURIComponent(state.apiKey));
-  ws.addEventListener('open', () => {
+  const url = 'wss://pumpportal.fun/api/data?api-key=' + encodeURIComponent(state.apiKey);
+
+  const ws = new WebSocketCtor(url);
+
+  ws.onopen = () => {
     state.liveStreamReady = true;
+    state.shuttingDown = false;
     console.log('Connected to PumpPortal realtime stream.');
     if (state.mint) {
-      ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [state.mint] }));
+      console.log('Subscribing to token trade for mint:', state.mint);
+      syncMintSubscription();
     }
-  });
+  };
 
-  ws.addEventListener('message', async (event) => {
+  ws.onmessage = async (event) => {
+    state.websocketMessageCount += 1;
+    writeMetaSnapshot('message');
+
+    if (state.debug) {
+      console.log('[ws] we got a message');
+    }
+
     try {
-      const payload = JSON.parse(String(event.data));
-      const price = extractPrice(payload);
-      if (price) {
-        state.lastPrice = Number(state.currentPrice) > 0 ? state.currentPrice : price;
-        state.currentPrice = price;
-        await maybeAutoTrade();
-        renderStrategyTick();
+      const raw = typeof event.data === 'string' ? event.data : Buffer.from(event.data).toString('utf8');
+
+      if (!raw) {
+        return;
       }
+
+      if (state.debug) {
+        console.log('[ws] raw message:', raw.slice(0, 1500));
+      }
+
+      const payload = JSON.parse(raw);
+      const price = extractPrice(payload);
+      if (!price || price <= 0) {
+        if (state.debug) {
+          debugTradeSignal('ws message ignored: no usable price in payload | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
+        }
+        return;
+      }
+
+      state.lastPrice = Number(state.currentPrice) > 0 ? state.currentPrice : price;
+      state.currentPrice = price;
+      if (state.debug) {
+        debugTradeSignal('ws price cached: ' + price + ' | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
+      }
+      await maybeAutoTrade();
+      renderStrategyTick();
     } catch (error) {
-      // Ignore parsing noise from the stream.
+      if (state.debug) {
+        console.log('[ws] parse ignored:', String(error && error.message ? error.message : error));
+      }
     }
-  });
+  };
 
-  ws.addEventListener('close', () => {
+  ws.onclose = () => {
     state.liveStreamReady = false;
-    console.log('PumpPortal stream closed.');
-  });
+    if (!state.shuttingDown) {
+      console.log('PumpPortal stream closed.');
+    }
+  };
 
-  ws.addEventListener('error', (error) => {
+  ws.onerror = (error) => {
     state.liveStreamReady = false;
-    console.log('PumpPortal stream error: ' + String(error.message || error));
-  });
+    console.log('PumpPortal stream error: ' + String(error && error.message ? error.message : error));
+  };
 
   state.websocket = ws;
   return ws;
@@ -958,17 +1116,18 @@ async function commandLoop() {
 
     if (lower === 'exit' || lower === 'quit') {
       console.log('Closing Caterkiller.');
+      cleanupRealtimeSocket();
       rl.close();
       return;
     }
 
-    if (lower === 'status' || lower === 'position' || lower === 'pos' || lower === 'info' || lower === 'dump') {
+    if (lower === 'status' || lower === 'position' || lower === 'pos') {
       await showStatus();
       rl.prompt();
       return;
     }
 
-    if (lower === 'balance' || lower === 'wallet') {
+    if (lower === 'wallet') {
       await getWalletBalance();
       rl.prompt();
       return;
@@ -980,22 +1139,21 @@ async function commandLoop() {
       return;
     }
 
-    if (lower === 'debug') {
+    if (lower === 'dbg') {
       state.debug = !state.debug;
       console.log('Verbose trade debug: ' + (state.debug ? 'on' : 'off'));
       rl.prompt();
       return;
     }
 
-    if (lower === 'strategy' || lower === 'strat') {
+    if (lower === 'strat') {
       console.log('Available strategies: ' + Object.keys(STRATEGIES).join(', '));
       rl.prompt();
       return;
     }
 
-    if (lower.startsWith('strategy ') || lower.startsWith('strat ')) {
-      const prefix = lower.startsWith('strategy ') ? 'strategy ' : 'strat ';
-      const name = input.slice(prefix.length).trim();
+    if (lower.startsWith('strat ')) {
+      const name = input.slice('strat '.length).trim();
       setStrategy(name);
       rl.prompt();
       return;
@@ -1038,6 +1196,26 @@ async function commandLoop() {
       return;
     }
 
+    if (lower === 'buyamt') {
+      console.log('Current buy amount: ' + state.buyAmountSol + ' SOL');
+      rl.prompt();
+      return;
+    }
+
+    if (lower.startsWith('buyamt ')) {
+      const amount = input.slice('buyamt '.length).trim();
+      const parsed = Number(amount);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        logError('Buy amount must be a positive number in SOL.');
+      } else {
+        state.buyAmountSol = parsed;
+        state.strategy = state.strategy || 'dca';
+        console.log('Buy amount set to: ' + parsed + ' SOL');
+      }
+      rl.prompt();
+      return;
+    }
+
     if (lower.startsWith('buy ')) {
       const amount = input.slice('buy '.length).trim();
       await buy(amount || String(PLACEHOLDER_DEFAULTS.BUY_SOL));
@@ -1059,17 +1237,28 @@ async function commandLoop() {
     }
 
     if (isMintLike(input)) {
-      state.mint = input.trim();
-      if (state.websocket) {
-        state.websocket.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [state.mint] }));
+      const nextMint = input.trim();
+      if (state.mint && nextMint !== state.mint && state.position.tokens > 0) {
+        const coinSymbol = await getTokenDisplayNameForMint(state.mint);
+        logWarning('Dumping existing holdings of ' + coinSymbol + '...');
+        await sell(100);
       }
+      state.mint = nextMint;
+      syncMintSubscription();
       console.log('Current mint set to: ' + state.mint);
       rl.prompt();
       return;
     }
 
     if (lower.startsWith('mint ')) {
-      state.mint = input.slice(4).trim();
+      const nextMint = input.slice(4).trim();
+      if (state.mint && nextMint !== state.mint && state.position.tokens > 0) {
+        const coinSymbol = await getTokenDisplayNameForMint(state.mint);
+        logWarning('Dumping existing holdings of ' + coinSymbol + '...');
+        await sell(100);
+      }
+      state.mint = nextMint;
+      syncMintSubscription();
       console.log('Current mint set to: ' + state.mint);
       rl.prompt();
       return;
@@ -1080,12 +1269,29 @@ async function commandLoop() {
   });
 
   rl.on('close', () => {
+    cleanupRealtimeSocket();
     process.exit(0);
   });
 }
 
+process.once('SIGINT', () => {
+  cleanupRealtimeSocket();
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  cleanupRealtimeSocket();
+  process.exit(0);
+});
+
+process.once('exit', () => {
+  cleanupRealtimeSocket();
+});
+
 (async function start() {
   fillStateFromEnv();
+  loadPersistedApiFeeSummary();
+  writeMetaSnapshot('boot');
   banner();
   printHelp();
   if (state.mint) {

@@ -6,31 +6,24 @@
 
 A tiny Pump.fun-style CLI trading bot for local experimentation.
 
-Warning: this project has not been fully tested yet, and it may not work reliably as-is.
+This is a prototype: simulation-first, mostly untested in live markets, and meant to be used carefully.
 
-## What it does
+It also tracks estimated PumpPortal API fee usage in [.api_fees](./.api_fees). On a hot coin, a busy websocket can cost roughly $0.10 for about 30 minutes.
 
-- Starts a simple interactive Node.js CLI
-- Lets you set a mint and configure a strategy
-- Has a default DCA strategy that buys on a fixed interval
-- Supports simulation mode by default
-- Optionally connects to the PumpPortal realtime feed when an API key is present
-- Lets you inspect status, balance, and market cap
-
-## Run it
+## Quick start
 
 ```bash
 npm install
 node caterkiller.js
 ```
 
-Or on Windows:
+Windows:
 
 ```bat
 start.bat
 ```
 
-## Configure
+## Config
 
 Copy `.env.example` to `.env` and edit it:
 
@@ -44,34 +37,26 @@ DCA_INTERVAL_MS=60000
 DCA_AMOUNT_SOL=0.01
 ```
 
-Notes:
-- `STRATEGY` can be `dca`, `momentum`, `meanReversion`, or `breakout`
-- `MODE` is `sim` or `live`
-- `live` sends real PumpPortal trades; `sim` keeps everything local and safe
-- `DCA_INTERVAL_MS` is in milliseconds
-- `DCA_AMOUNT_SOL` is the SOL amount to buy each interval
-
 ## Commands
 
 ```text
 help
-status
-balance
+pos
+wallet
 mcap
-price 0.0001
-strategy dca
+strat
+strat dca
 start
 stop
-buy
+buyamt 0.01
 buy 0.01
-sell
-sell 50
+sell 100
 exit
 ```
 
-## Important
+## Notes
 
-This is a minimal local tool for experimentation, not a production trading system.
-It is simulation-first and should be used carefully.
-
-This project has not been fully tested yet, and it may not work correctly in its current form.
+- `STRATEGY` can be `dca`, `momentum`, `meanReversion`, or `breakout`
+- `MODE` is `sim` or `live`
+- Live trading is experimental and depends on the current PumpPortal feed
+- This project is not a production trading system
