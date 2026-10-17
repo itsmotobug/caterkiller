@@ -10,6 +10,10 @@ This is a prototype: simulation-first, mostly untested in live markets, and mean
 
 It also tracks estimated PumpPortal API fee usage in [.api_fees](./.api_fees). On a hot coin, a busy websocket can cost roughly $0.10 for about 30 minutes.
 
+See also
+
+[Program jargon.txt](./jargon.txt)
+
 ## Quick start
 
 ```bash
@@ -44,8 +48,8 @@ help
 pos
 wallet
 mcap
-strat
-strat dca
+strategy
+strategy dca
 start
 stop
 buyamt 0.01

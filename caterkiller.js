@@ -23,7 +23,8 @@ const ANSI = {
   red: '\x1b[31m',
   green: '\x1b[32m',
   yellow: '\x1b[33m',
-  cyan: '\x1b[32m' // '\x1b[36m',
+  cyan: '\x1b[32m', // '\x1b[36m',
+  magenta: '\x1b[35m',
 };
 
 function colorize(text, code) {
@@ -62,6 +63,8 @@ const state = {
   solanaUsdPrice: null,
   priceHistory: [],
   lastSignalAt: 0,
+  lastWsEventAt: 0,
+  currentTokenSymbol: '',
   strategyCooldownMs: 10 * 1000,
   dcaIntervalMs: 60 * 1000,
   buyAmountSol: PLACEHOLDER_DEFAULTS.DCA_SOL,
@@ -70,6 +73,7 @@ const state = {
   lastPumpPortalApiCallAt: null,
   statusRenderThrottleMs: 3000,
   lastStatusRenderAt: 0,
+  statusRenderLoop: null,
   rl: null,
   position: {
     tokens: 0,
@@ -83,7 +87,8 @@ const state = {
   debug: false,
   shuttingDown: false,
   lastSubscribedMint: '',
-  websocketMessageCount: 0,
+  sessionEventCount: 0,
+  apiFeeEventCount: 0,
   metaFilePath: path.join(__dirname, '.api_fees'),
 };
 
@@ -94,14 +99,14 @@ function loadPersistedApiFeeSummary() {
     }
 
     const raw = fs.readFileSync(state.metaFilePath, 'utf8');
-    const match = raw.match(/messages_received:\s*([0-9]+)/i);
+    const match = raw.match(/(?:events_received|messages_received):\s*([0-9]+)/i);
     if (!match) {
       return;
     }
 
     const value = Number(match[1]);
     if (Number.isFinite(value) && value >= 0) {
-      state.websocketMessageCount = value;
+      state.apiFeeEventCount = value;
     }
   } catch (error) {
     // Ignore unreadable or stale metadata; start from zero.
@@ -132,6 +137,41 @@ function loadEnv(filePath) {
   }
 
   return env;
+}
+
+function writeEnvValue(key, value) {
+  const normalizedKey = String(key || '').trim();
+  const normalizedValue = String(value == null ? '' : value).trim();
+
+  if (!normalizedKey) {
+    return false;
+  }
+
+  const lines = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8').split(/\r?\n/) : [];
+  let updated = false;
+
+  const nextLines = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
+      return line;
+    }
+
+    const index = trimmed.indexOf('=');
+    const entryKey = trimmed.slice(0, index).trim();
+    if (entryKey !== normalizedKey) {
+      return line;
+    }
+
+    updated = true;
+    return normalizedKey + '=' + normalizedValue;
+  });
+
+  if (!updated) {
+    nextLines.push(normalizedKey + '=' + normalizedValue);
+  }
+
+  fs.writeFileSync(envPath, nextLines.join('\n') + '\n', 'utf8');
+  return true;
 }
 
 function normalizeMode(raw) {
@@ -212,7 +252,7 @@ function printHelp() {
   console.log('  wallet              Show the current SOL balance for the configured wallet');
   console.log('  mcap                Show the current mint market cap from PumpPortal/Pump.fun');
   console.log('  pos                 Show current position, bot state, and account snapshot');
-  console.log('  strat [NAME]        Set the active strategy');
+  console.log('  strategy [NAME]     Set the active strategy');
   console.log('  dbg                 Toggle verbose trade-signal logging');
   console.log('  start               Start the active strategy');
   console.log('  stop                Stop the active strategy');
@@ -323,6 +363,28 @@ function formatCachedPrice() {
   return formatPrice(state.currentPrice, 'SOL');
 }
 
+function getCurrentTokenSymbol() {
+  if (state.currentTokenSymbol) {
+    return state.currentTokenSymbol.toUpperCase();
+  }
+  if (state.mint) {
+    return state.mint.slice(0, 4).toUpperCase();
+  }
+  return 'NONE';
+}
+
+async function refreshCurrentTokenSymbol() {
+  if (!state.mint) {
+    state.currentTokenSymbol = '';
+    return;
+  }
+
+  const symbol = await getTokenDisplayNameForMint(state.mint);
+  if (symbol) {
+    state.currentTokenSymbol = symbol;
+  }
+}
+
 function renderStatusBanner(force = false) {
   if (state.liveConfirmationPending) {
     return;
@@ -337,26 +399,40 @@ function renderStatusBanner(force = false) {
     return;
   }
 
-  const feed = state.liveStreamReady ? 'feed connected' : 'feed idle';
-  const mode = state.botRunning ? 'bot running' : 'bot stopped';
   const price = formatCachedPrice();
-  const wsCost = state.websocketMessageCount / 10000;
-  const message = 'status: mode=' + mode + ' | ' + feed + ' | price=' + price + ' | ws msgs=' + state.websocketMessageCount + ' (~$' + round(wsCost, 6) + ' @ $1/10k) | mint=' + (state.mint || '<none>');
-  console.log(message);
+  const ageSeconds = state.lastWsEventAt ? Math.max(0, Math.round((Date.now() - state.lastWsEventAt) / 1000)) : 0;
+  const feed = state.liveStreamReady ? 'LIVE' : 'IDLE';
+  const mode = state.botRunning ? 'AUTO' : 'MANUAL';
+  const token = getCurrentTokenSymbol();
+  const message = 'Trading ' + token + ' | ' + price + ' | last event received (' + ageSeconds + 's ago) | ws events since startup ' + state.sessionEventCount;
+  console.log(colorize(message, ANSI.magenta));
   state.lastStatusRenderAt = now;
 }
 
-function renderStrategyTick() {
-  if (state.liveConfirmationPending) {
+function startStatusRenderLoop() {
+  if (state.statusRenderLoop) {
     return;
   }
-  if (!state.liveStreamReady || !state.mint) {
-    return;
+
+  state.statusRenderLoop = setInterval(() => {
+    if (state.liveConfirmationPending) {
+      return;
+    }
+    if (!state.liveStreamReady || !state.mint) {
+      return;
+    }
+    if (state.rl && typeof state.rl.line === 'string' && state.rl.line.length > 0) {
+      return;
+    }
+    renderStatusBanner();
+  }, 5000);
+}
+
+function stopStatusRenderLoop() {
+  if (state.statusRenderLoop) {
+    clearInterval(state.statusRenderLoop);
+    state.statusRenderLoop = null;
   }
-  if (state.rl && typeof state.rl.line === 'string' && state.rl.line.length > 0) {
-    return;
-  }
-  renderStatusBanner();
 }
 
 async function getWalletBalance() {
@@ -506,18 +582,18 @@ function formatPercent(value) {
 }
 
 function getPositionPerformance() {
-  const pnlSol = Number((state.position.realizedPnL || 0) + (recalcPnL() || 0));
   const costBasis = Number(state.position.totalCostSol || 0);
-  if (!Number.isFinite(pnlSol) || !Number.isFinite(costBasis) || costBasis <= 0) {
+  if (!Number.isFinite(costBasis) || costBasis <= 0) {
     return { pct: null, multiple: null };
   }
 
-  const pct = (pnlSol / costBasis) * 100;
   const value = Number(state.currentPrice || 0) * Number(state.position.tokens || 0);
-  const multiple = costBasis > 0 ? (value + Math.max(0, state.position.realizedPnL || 0)) / costBasis : null;
+  const unrealizedPnL = value - costBasis;
+  const pct = (unrealizedPnL / costBasis) * 100;
+  const multiple = value / costBasis;
 
   return {
-    pct,
+    pct: Number.isFinite(pct) ? pct : null,
     multiple: Number.isFinite(multiple) ? multiple : null,
   };
 }
@@ -563,7 +639,7 @@ async function showStatus() {
   console.log('  last api call:     ' + (state.lastPumpPortalApiCallAt ? new Date(state.lastPumpPortalApiCallAt).toISOString() : 'never'));
   console.log('  api key:           ' + (state.apiKey ? 'loaded' : 'missing'));
   console.log('  wallet key:        ' + (state.publicWallet ? 'loaded' : 'missing'));
-  console.log('  strat:             ' + state.strategy);
+  console.log('  strategy:          ' + state.strategy);
   console.log('  strategy info:     ' + strategyInfo);
   console.log('  interval:          ' + (state.strategy === 'dca' ? (state.dcaIntervalMs / 1000) + 's' : 'n/a'));
   console.log('  buy amount:        ' + (Number.isFinite(state.buyAmountSol) && state.buyAmountSol > 0 ? state.buyAmountSol + ' SOL' : 'n/a'));
@@ -575,9 +651,8 @@ async function showStatus() {
   console.log('  total cost:        ' + formatSolAmount(state.position.totalCostSol, 9) + ' SOL');
   console.log('  realized PnL:      ' + formatSolAmount(state.position.realizedPnL, 9) + ' SOL');
   console.log('  unrealized PnL:    ' + formatSolAmount(recalcPnL(), 9) + ' SOL');
+  console.log('  unrealized gain:   ' + (performance.pct === null || performance.multiple === null ? 'n/a' : formatPercent(performance.pct) + ' / ' + performance.multiple.toFixed(2) + 'x'));
   console.log('  -------------------')
-  console.log('  gain pct:          ' + (performance.pct === null ? 'n/a' : formatPercent(performance.pct)));
-  console.log('  gain x:            ' + (performance.multiple === null ? 'n/a' : performance.multiple.toFixed(2) + 'x'));
   console.log('  profit:            ' + (profitUsd === null ? 'n/a' : formatMoney(profitUsd, { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + ' USD'));
   console.log('  holdings:          ' + (state.position.tokens > 0 ? formatMoney((state.position.tokens * Number(state.currentPrice || 0)) * state.solanaUsdPrice, { minimumFractionDigits: 2, maximumFractionDigits: 4 }) + ' USD' : '$0.00 USD'));
 }
@@ -642,7 +717,7 @@ function showStrategy() {
   console.log('  buy amount:        ' + (Number.isFinite(state.buyAmountSol) && state.buyAmountSol > 0 ? state.buyAmountSol + ' SOL' : 'n/a'));
   console.log('  price trend:       ' + stats.changePct.toFixed(3) + '%');
   console.log('  price avg:         ' + formatPrice(stats.avg, 'SOL'));
-  console.log('  strat:             ' + state.strategy);
+  console.log('  strategy:          ' + state.strategy);
   console.log('  strategy info:     ' + active);
 }
 
@@ -945,17 +1020,23 @@ function syncMintSubscription() {
 }
 
 function writeMetaSnapshot(reason = 'tick') {
-  const messages = Number(state.websocketMessageCount || 0);
-  const approxUsd = messages * (1 / 10000);
+  const sessionEvents = Number(state.sessionEventCount || 0);
+  const totalEvents = Number(state.apiFeeEventCount || 0) + sessionEvents;
+  const approxUsd = totalEvents * (1 / 10000);
   const yaml = [
-    'messages_received: ' + messages,
+    'events_received: ' + totalEvents,
     'estimated_usd: ' + round(approxUsd, 6),
-    'billing_rule: "$1 per 10000 messages"',
+    'billing_rule: "$1 per 10000 events"',
     'api_fee_estimate_usd: ' + round(approxUsd, 6),
     'last_updated: ' + new Date().toISOString(),
     'last_reason: ' + reason,
+    'session_events_since_startup: ' + sessionEvents,
+    'updated_in_realtime: true',
+    'file_purpose: websocket fee logging snapshot',
     ''
   ].join('\n');
+
+  state.apiFeeEventCount = totalEvents;
 
   try {
     fs.writeFileSync(state.metaFilePath, yaml, 'utf8');
@@ -998,8 +1079,11 @@ async function connectRealtime() {
     return null;
   }
 
-  const WebSocketCtor = globalThis.WebSocket || require('ws');
+  if (state.shuttingDown) {
+    return null;
+  }
 
+  const WebSocketCtor = globalThis.WebSocket || require('ws');
   const url = 'wss://pumpportal.fun/api/data?api-key=' + encodeURIComponent(state.apiKey);
 
   const ws = new WebSocketCtor(url);
@@ -1007,6 +1091,7 @@ async function connectRealtime() {
   ws.onopen = () => {
     state.liveStreamReady = true;
     state.shuttingDown = false;
+    startStatusRenderLoop();
     console.log('Connected to PumpPortal realtime stream.');
     if (state.mint) {
       console.log('Subscribing to token trade for mint:', state.mint);
@@ -1015,11 +1100,12 @@ async function connectRealtime() {
   };
 
   ws.onmessage = async (event) => {
-    state.websocketMessageCount += 1;
-    writeMetaSnapshot('message');
+    state.sessionEventCount += 1;
+    state.lastWsEventAt = Date.now();
+    writeMetaSnapshot('event');
 
     if (state.debug) {
-      console.log('[ws] we got a message');
+      console.log('[ws] we got an event');
     }
 
     try {
@@ -1030,14 +1116,14 @@ async function connectRealtime() {
       }
 
       if (state.debug) {
-        console.log('[ws] raw message:', raw.slice(0, 1500));
+        console.log('[ws] raw event:', raw.slice(0, 1500));
       }
 
       const payload = JSON.parse(raw);
       const price = extractPrice(payload);
       if (!price || price <= 0) {
         if (state.debug) {
-          debugTradeSignal('ws message ignored: no usable price in payload | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
+          debugTradeSignal('ws event ignored: no usable price in payload | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
         }
         return;
       }
@@ -1048,7 +1134,6 @@ async function connectRealtime() {
         debugTradeSignal('ws price cached: ' + price + ' | keys=' + Object.keys(payload || {}).slice(0, 10).join(', '));
       }
       await maybeAutoTrade();
-      renderStrategyTick();
     } catch (error) {
       if (state.debug) {
         console.log('[ws] parse ignored:', String(error && error.message ? error.message : error));
@@ -1058,14 +1143,28 @@ async function connectRealtime() {
 
   ws.onclose = () => {
     state.liveStreamReady = false;
+    stopStatusRenderLoop();
     if (!state.shuttingDown) {
       console.log('PumpPortal stream closed.');
+      setTimeout(() => {
+        if (!state.shuttingDown) {
+          connectRealtime();
+        }
+      }, 5000);
     }
   };
 
   ws.onerror = (error) => {
     state.liveStreamReady = false;
+    stopStatusRenderLoop();
     console.log('PumpPortal stream error: ' + String(error && error.message ? error.message : error));
+    if (!state.shuttingDown) {
+      setTimeout(() => {
+        if (!state.shuttingDown) {
+          connectRealtime();
+        }
+      }, 5000);
+    }
   };
 
   state.websocket = ws;
@@ -1146,14 +1245,14 @@ async function commandLoop() {
       return;
     }
 
-    if (lower === 'strat') {
+    if (lower === 'strategy' || lower === 'strat') {
       console.log('Available strategies: ' + Object.keys(STRATEGIES).join(', '));
       rl.prompt();
       return;
     }
 
-    if (lower.startsWith('strat ')) {
-      const name = input.slice('strat '.length).trim();
+    if (lower.startsWith('strategy ') || lower.startsWith('strat ')) {
+      const name = input.slice(input.split(' ')[0].length + 1).trim();
       setStrategy(name);
       rl.prompt();
       return;
@@ -1210,6 +1309,7 @@ async function commandLoop() {
       } else {
         state.buyAmountSol = parsed;
         state.strategy = state.strategy || 'dca';
+        writeEnvValue('DCA_AMOUNT_SOL', parsed);
         console.log('Buy amount set to: ' + parsed + ' SOL');
       }
       rl.prompt();
@@ -1238,28 +1338,42 @@ async function commandLoop() {
 
     if (isMintLike(input)) {
       const nextMint = input.trim();
-      if (state.mint && nextMint !== state.mint && state.position.tokens > 0) {
-        const coinSymbol = await getTokenDisplayNameForMint(state.mint);
-        logWarning('Dumping existing holdings of ' + coinSymbol + '...');
-        await sell(100);
+      if (state.mint && nextMint === state.mint) {
+        logWarning('Mint is already set to: ' + state.mint + ' — no change made.');
+      } else {
+        if (state.mint && nextMint !== state.mint && state.position.tokens > 0) {
+          const coinSymbol = await getTokenDisplayNameForMint(state.mint);
+          logWarning('Dumping existing holdings of ' + coinSymbol + '...');
+          await sell(100);
+        }
+        state.mint = nextMint;
+        state.currentTokenSymbol = '';
+        await refreshCurrentTokenSymbol();
+        writeEnvValue('MINT', nextMint);
+        syncMintSubscription();
+        console.log('Current mint set to: ' + state.mint);
       }
-      state.mint = nextMint;
-      syncMintSubscription();
-      console.log('Current mint set to: ' + state.mint);
       rl.prompt();
       return;
     }
 
     if (lower.startsWith('mint ')) {
       const nextMint = input.slice(4).trim();
-      if (state.mint && nextMint !== state.mint && state.position.tokens > 0) {
-        const coinSymbol = await getTokenDisplayNameForMint(state.mint);
-        logWarning('Dumping existing holdings of ' + coinSymbol + '...');
-        await sell(100);
+      if (state.mint && nextMint === state.mint) {
+        logWarning('Mint is already set to: ' + state.mint + ' — no change made.');
+      } else {
+        if (state.mint && nextMint !== state.mint && state.position.tokens > 0) {
+          const coinSymbol = await getTokenDisplayNameForMint(state.mint);
+          logWarning('Dumping existing holdings of ' + coinSymbol + '...');
+          await sell(100);
+        }
+        state.mint = nextMint;
+        state.currentTokenSymbol = '';
+        await refreshCurrentTokenSymbol();
+        writeEnvValue('MINT', nextMint);
+        syncMintSubscription();
+        console.log('Current mint set to: ' + state.mint);
       }
-      state.mint = nextMint;
-      syncMintSubscription();
-      console.log('Current mint set to: ' + state.mint);
       rl.prompt();
       return;
     }
@@ -1291,6 +1405,9 @@ process.once('exit', () => {
 (async function start() {
   fillStateFromEnv();
   loadPersistedApiFeeSummary();
+  if (state.mint) {
+    await refreshCurrentTokenSymbol();
+  }
   writeMetaSnapshot('boot');
   banner();
   printHelp();
