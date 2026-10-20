@@ -38,7 +38,7 @@ MINT=11111111111111111111111111111111111111111111
 STRATEGY=dca
 MODE=sim
 DCA_INTERVAL_MS=60000
-DCA_AMOUNT_SOL=0.01
+BUY_AMOUNT_SOL=0.01
 ```
 
 ## Commands
@@ -60,21 +60,7 @@ exit
 
 ## Layout
 
-```text
-caterkiller.js        entry point
-js/app.js             startup and process hooks
-js/config.js          constants, endpoints, strategy table
-js/state.js           shared mutable state
-js/math.js            pure numeric helpers
-js/format.js          display formatting
-js/log.js             colored console output
-js/env.js             .env read and write
-js/settings.js        state from .env
-js/api/               PumpPortal, Pump.fun, Solana RPC, and websocket clients
-js/trading/           price extraction, history, positions, signals, execution
-js/ui/                status, help, banner, and prompt rendering
-js/cli/               command table and REPL loop
-```
+The whole program is one file, `caterkiller.js`, split into labeled sections: config, state, math and formatting, logging, `.env` handling, API clients, positions, signals, execution, status display, realtime stream, commands, REPL, and startup.
 
 ## Notes
 
